@@ -1,0 +1,28 @@
+# love2d save / log artifacts
+*.love
+love.log
+save/
+*.sav
+
+# build output (keep the shipped linux-x64 binaries + sidlove_sid.so)
+build/
+*.o
+*.obj
+
+# sid_shim: keep the prebuilt .so and sources, ignore transient rebuilds
+sid_shim/*.o
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# the local test renders (kept out of the repo)
+*.wav
+*.raw
+render_out/
