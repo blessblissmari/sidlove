@@ -30,7 +30,6 @@ local streamer, player, raster, drum, filter, envbinding
 local kind, info_str
 local paused = false
 local show_raster = true
-local drum_on = false
 local env_on = false
 local voice_muted = {false, false, false, false}
 
@@ -82,17 +81,12 @@ function love.load(args)
     return
   end
 
-  -- Streamer pumps the player into Love2D audio.
-  streamer = sidlove.Streamer{ player = player, bufferFrames = 2048, bufferCount = 4 }
-  player:setLoop(true)
-  player:play()
-
   -- Raster: snap the SID state at the play-rate for visuals. Desktop-only
   -- (reads live SID regs via the native shim); nil on web / no-native builds.
   if sidlove.Raster then
     raster = sidlove.Raster{
       player = player,
-      clock = (player.info and player.info().clock_speed == 2) and "ntsc" or "pal",
+      clock = (player.info and player.info().clock == "NTSC") and "ntsc" or "pal",
       on_tick = function(dt, frame) end,
     }
   else
@@ -102,7 +96,9 @@ function love.load(args)
   -- 4-bit digi drum: a tiny loop of packed nibbles. This is what a C64
   -- digi-drum looks like in a tune - 256 samples of 4-bit data looped at
   -- ~6 kHz. We synthesize a decaying noise burst procedurally so the demo
-  -- is self-contained.
+  -- is self-contained. It is layered over the tune by the Streamer's
+  -- mixers hook (the drum's mix_into runs after each player fill); the
+  -- D key toggles drum.enabled, so no extra per-frame bookkeeping here.
   drum = require("sidlove.sample_player"){ sampleRate = 44100 }
   local nibbles = {}
   for i = 0, 255 do
@@ -117,6 +113,13 @@ function love.load(args)
   end
   drum:add(drum.Voice.new(table.concat(packed),
                           { rate = 6000, bits = 4, loop = true, vol = 0.4 }))
+  drum.enabled = false  -- start silent; D toggles
+
+  -- Streamer pumps the player into Love2D audio, with the drum mixed on top.
+  streamer = sidlove.Streamer{ player = player, mixers = { drum },
+                               bufferFrames = 2048, bufferCount = 4 }
+  player:setLoop(true)
+  player:play()
 
   -- Filter module: a slow ADSR that sweeps the SID 6581 filter curve (or
   -- for MIDI, the filter cutoff CC). Demonstrates live patching.
@@ -142,8 +145,7 @@ end
 function love.update(dt)
   if not streamer then return end
   if not paused then
-    streamer:update(dt)
-    if drum_on then drum:tick(dt) end
+    streamer:update(dt)   -- also runs drum:mix_into via the mixers hook
     if raster and show_raster then raster:update(dt) end
     if filter then filter:tick(dt) end
   end
@@ -214,7 +216,7 @@ function love.keypressed(k)
        if cur < 1 then cur = ti.songs or 1 end
        player:select_song(cur)
   elseif k == "d" then
-       drum_on = not drum_on
+       if drum then drum.enabled = not drum.enabled end
   elseif k == "e" then
        env_on = not env_on
        if env_on then

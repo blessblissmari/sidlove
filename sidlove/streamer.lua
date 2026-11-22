@@ -21,6 +21,10 @@ M.__index = M
 
 -- opts:
 --   player     -> a Player instance (sid/chiptune/midi)
+--   mixers     -> optional list of mixer objects with :mix_into(out, frames)
+--                 (e.g. a sidlove.Sample); each runs after the player fill so
+--                 digi samples layer on top of the tune. A mixer with
+--                 enabled == false is skipped that frame.
 --   bufferFrames -> frames per SoundData (default 2048, ~46ms at 44.1k)
 --   bufferCount  -> number of rotating SoundData buffers (default 4)
 --   sampleRate, channels, bitDepth -> from player if absent
@@ -60,6 +64,7 @@ function M.new(opts)
 
   local self = setmetatable({
     player = p,
+    mixers = opts.mixers or nil,
     source = src,
     sds = sds,
     scratch = scratch,
@@ -74,10 +79,21 @@ function M.new(opts)
   return self
 end
 
+-- Layer the optional mixers over the first `got` frames of the scratch
+-- buffer/table. No-op when no mixers were configured.
+function M:_apply_mixers(got)
+  if not self.mixers then return end
+  for _, mx in ipairs(self.mixers) do
+    if mx and mx.mix_into and mx.enabled ~= false and got > 0 then
+      mx:mix_into(self.use_ffi and self.scratch or self.scratch_tab, got)
+    end
+  end
+end
+
 -- Called every love.update(dt). Pumps enough audio to keep the queue full.
 -- We never block: if the player has nothing to give, we queue silence so
 -- the source doesn't underrun and click.
-function M:update(dt)
+function M:update(_dt)
   local free = self.source:getFreeBufferCount()
   local ch = self.channels
   local n = self.frames
@@ -87,6 +103,7 @@ function M:update(dt)
     local got
     if self.use_ffi then
       got = self.player:fill_into(self.scratch, n)
+      if got > 0 then self:_apply_mixers(got) end
       if got < n then
         ffi.fill(self.scratch + got * ch, (n - got) * ch * 2, 0)
         self._starved = self._starved + 1
@@ -96,10 +113,14 @@ function M:update(dt)
       -- web / pure-Lua path: fill a Lua table of interleaved int16, then
       -- write each sample into the SoundData via setSample.
       got = self.player:fillFloats(self.scratch_tab, n)
+      if got > 0 then self:_apply_mixers(got) end
       local total = n * ch
+      -- Zero the tail past what the player wrote: the table keeps values
+      -- from previous frames, and setSample would otherwise replay stale
+      -- audio during an underrun.
+      for i = got * ch + 1, total do self.scratch_tab[i] = 0 end
       for i = 1, total do
-        local v = self.scratch_tab[i] or 0
-        sd:setSample(i - 1, v / 32768)
+        sd:setSample(i - 1, (self.scratch_tab[i] or 0) / 32768)
       end
       if got < n then self._starved = self._starved + 1 end
     end
@@ -131,4 +152,4 @@ function M:dispose()
   for _, sd in ipairs(self.sds) do sd:release() end
 end
 
-return M
+return setmetatable(M, { __call = function(_, ...) return M.new(...) end })

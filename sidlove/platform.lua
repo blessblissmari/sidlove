@@ -143,22 +143,25 @@ function M.init(native_root)
     return M
   end
 
-  local g = M.dir and try_load_any(M.dir, "libgme", M.os)
-  if g then gme_ffi.load(""); gme_ffi.lib = g; gme_ffi.loaded = true; M.engines.gme = true end
-
-  local s = M.dir and try_load_any(M.dir, "sidlove_sid", M.os)
-  if s then sid_ffi.load(""); sid_ffi.lib = s; sid_ffi.loaded = true; M.engines.sid = true end
-
-  local f = M.dir and try_load_any(M.dir, "libfluidsynth", M.os)
-  if f then fluid_ffi.load(""); fluid_ffi.lib = f; fluid_ffi.loaded = true; M.engines.fluid = true end
-
-  if not M.engines.gme then
-    local ok, lib = pcall(ffi.load, "gme")
-    if ok then gme_ffi.lib = lib; gme_ffi.loaded = true; M.engines.gme = true end
-  end
-  if not M.engines.fluid then
-    local ok, lib = pcall(ffi.load, "fluidsynth")
-    if ok then fluid_ffi.lib = lib; fluid_ffi.loaded = true; M.engines.fluid = true end
+  -- Each engine: load the bundled shim from native/<tag>, else fall back to
+  -- a system-wide install (apt-installed libgme / libfluidsynth).
+  local engines = {
+    { base = "libgme",        ffi_mod = gme_ffi,   flag = "gme",   soname = "gme" },
+    { base = "sidlove_sid",   ffi_mod = sid_ffi,   flag = "sid",   soname = nil },
+    { base = "libfluidsynth", ffi_mod = fluid_ffi, flag = "fluid", soname = "fluidsynth" },
+  }
+  for _, e in ipairs(engines) do
+    local lib = M.dir and try_load_any(M.dir, e.base, M.os)
+    if not lib and e.soname then
+      local ok, so = pcall(ffi.load, e.soname)
+      if ok then lib = so end
+    end
+    if lib then
+      e.ffi_mod.load("")
+      e.ffi_mod.lib = lib
+      e.ffi_mod.loaded = true
+      M.engines[e.flag] = true
+    end
   end
 
   return M

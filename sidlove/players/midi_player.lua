@@ -18,7 +18,8 @@ local fluid_ffi = require("sidlove.ffi.fluid_ffi")
 local ffi       = require("ffi")
 
 local M = {}
-M.__index = setmetatable(M, base)
+-- instance -> M's own methods, then -> base via the module metatable
+M.__index = M
 
 -- Re-exported constants
 M.TEMPO_INTERNAL      = fluid_ffi.TEMPO_INTERNAL
@@ -33,7 +34,7 @@ local function new(opts)
     return nil, "MIDI engine not loaded (libfluidsynth missing)"
   end
   local self = base.new(opts)
-  setmetatable(self, {__index = M})
+  setmetatable(self, M)   -- M.__index chains to base
   self.kind = "midi"
 
   local lib = fluid_ffi.lib
@@ -237,4 +238,4 @@ function M:dispose()
   end
 end
 
-return setmetatable(M, {__call = function(_, opts) return new(opts) end})
+return setmetatable(M, { __index = base, __call = function(_, opts) return new(opts) end })

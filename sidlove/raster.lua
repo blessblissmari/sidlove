@@ -115,4 +115,4 @@ function M:sid_named()
   return t
 end
 
-return M
+return setmetatable(M, { __call = function(_, ...) return M.new(...) end })

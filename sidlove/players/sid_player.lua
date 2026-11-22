@@ -11,7 +11,8 @@ local sid_ffi = require("sidlove.ffi.sid_ffi")
 local ffi    = require("ffi")
 
 local M = {}
-M.__index = setmetatable(M, base)
+-- instance -> M's own methods, then -> base via the module metatable
+M.__index = M
 
 -- Constants re-exported for user code (sidlove.SID.MODEL_8580 etc.)
 M.MODEL_6581 = sid_ffi.MODEL_6581
@@ -42,7 +43,7 @@ local function new(opts)
     return nil, "SID engine not loaded (sidlove_sid.so/.dll/.dylib missing)"
   end
   local self = base.new(opts)
-  setmetatable(self, {__index = M})
+  setmetatable(self, M)   -- M.__index chains to base
   self.kind = "sid"
 
   local lib = sid_ffi.lib
@@ -167,4 +168,4 @@ function M:dispose()
   end
 end
 
-return setmetatable(M, {__call = function(_, opts) return new(opts) end})
+return setmetatable(M, { __index = base, __call = function(_, opts) return new(opts) end })

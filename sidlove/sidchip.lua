@@ -585,10 +585,12 @@ function M:set_mute(voice, on)
   if voice >= 1 and voice <= 3 then self.muted[voice] = on end
 end
 
--- snapshot of registers for the visualiser / debugger
+-- snapshot of registers for the visualiser / debugger.
+-- 1-indexed: index r+1 holds register r, matching the native engine's
+-- status_table() (raster.lua reads s[i + 1] on both engines).
 function M:regs()
   local t = {}
-  for i = 0, 0x1F do t[i] = self.reg[i] end
+  for i = 0, 0x1F do t[i + 1] = self.reg[i] end
   return t
 end
 

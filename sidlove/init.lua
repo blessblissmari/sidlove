@@ -71,10 +71,6 @@ function M.init(opts)
   M.engines.sid_pure  = true   -- always
   M.platform_info = { os = platform.os, arch = platform.arch, tag = platform.tag,
                       dir = platform.dir, web = platform.web }
-  if not (M.engines.sid or M.engines.chiptune or M.engines.midi or M.engines.sid_pure) then
-    return nil, "sidlove: no audio engines loaded (native libs not found in "
-                .. tostring(platform.dir) .. ")"
-  end
   return true
 end
 
@@ -92,7 +88,7 @@ local function sniff(data, ext)
   if h == "MThd" then return "midi" end
   if h == "NESM" or h == "NSFE" then return "chiptune" end  -- NSF / NSFE
   if h:sub(1,2) == "Vg" then return "chiptune" end          -- VGM/VGZ
-  if data:sub(1,37) == "SAP\r\nAUTHOR " then return "chiptune" end  -- SAP
+  if data:sub(1,12) == "SAP\r\nAUTHOR " then return "chiptune" end  -- SAP (prefix, tolerates truncation)
   if h == "SNES" then return "chiptune" end                 -- SPC (SPC700)
   if data:sub(1,3) == "GBS" then return "chiptune" end
   if data:sub(1,2) == "AY" then return "chiptune" end
@@ -123,38 +119,41 @@ function M.load(path, opts)
 end
 
 -- Load from memory. data is a Lua string. kind is "sid"/"chiptune"/"midi".
+-- The native engines take an FFI uint8 buffer; the pure engine takes the
+-- string directly. local buf() builds whichever cbuf a native player needs.
 function M.load_buffer(data, kind, opts)
   opts = opts or {}
+  local function buf()
+    local ffi = require("ffi")
+    local n = #data
+    return ffi.new("uint8_t[?]", n + 1, data), n
+  end
+
   local player, perr
   if kind == "sid" then
     -- Route: native reSIDfp if available, else (or if opts.force_pure) the
-    -- pure-Lua engine. The pure path takes a Lua string directly; the native
-    -- path needs an FFI uint8 buffer.
+    -- pure-Lua engine.
     local use_pure = opts.force_pure or not M.engines.sid
     if use_pure then
-      if not M.engines.sid_pure then return nil, "pure SID engine unavailable" end
       player = sid_pure_player(opts)
       if player then
         local ok, e = player:load_buffer_str(data, #data)
         if not ok then player:dispose(); return nil, e end
         player:select_song(opts.song or 1)
       end
-    else
-      if not have_ffi then return nil, "SID engine not loaded (no FFI; use opts.force_pure=true)" end
-      local ffi = require("ffi")
-      local n = #data
-      local cbuf = ffi.new("uint8_t[?]", n + 1, data)
+    elseif have_ffi then
+      local cbuf, n = buf()
       player, perr = sid_player(opts)
       if player then
         local ok, e = player:load_buffer(cbuf, n)
         if not ok then player:dispose(); return nil, e end
       end
+    else
+      return nil, "SID engine not loaded (no FFI; use opts.force_pure=true)"
     end
   elseif kind == "chiptune" then
     if not M.engines.chiptune then return nil, "chiptune engine not loaded (libgme absent; not available on web)" end
-    local ffi = require("ffi")
-    local n = #data
-    local cbuf = ffi.new("uint8_t[?]", n + 1, data)
+    local cbuf, n = buf()
     player, perr = chiptune_player(opts)
     if player then
       local ok, e = player:load_buffer(cbuf, n)
@@ -163,19 +162,14 @@ function M.load_buffer(data, kind, opts)
     end
   elseif kind == "midi" then
     if not M.engines.midi then return nil, "MIDI engine not loaded (libfluidsynth absent; not available on web)" end
-    local ffi = require("ffi")
-    local n = #data
-    local cbuf = ffi.new("uint8_t[?]", n + 1, data)
+    if not opts.soundfont then return nil, "midi: opts.soundfont (.sf2/.sf3) required" end
+    local cbuf, n = buf()
     player, perr = midi_player(opts)
     if player then
-      if opts.soundfont then
-        local sfid, e = player:load_soundfont(opts.soundfont)
-        if not sfid then player:dispose(); return nil, e end
-      else
-        return nil, "midi: opts.soundfont (.sf2/.sf3) required"
-      end
-      local ok, e = player:add_midi_buffer(cbuf, n)
-      if not ok then player:dispose(); return nil, e end
+      local sfid, e = player:load_soundfont(opts.soundfont)
+      if not sfid then player:dispose(); return nil, e end
+      local ok, e2 = player:add_midi_buffer(cbuf, n)
+      if not ok then player:dispose(); return nil, e2 end
     end
   else
     return nil, "unknown kind: " .. tostring(kind)
@@ -188,12 +182,23 @@ function M.load_buffer(data, kind, opts)
 end
 
 -- Convenience: build a Streamer around a player in one call.
+--   local s = sidlove.play(sidlove.load("tune.sid"))
+--   function love.update(dt) s:update(dt) end
+-- opts is forwarded to Streamer.new (bufferFrames, bufferCount, mixers...).
 function M.play(player, opts)
-  return Streamer(opts and opts.streamer or {})
+  if not player then return nil, "sidlove.play: player required" end
+  opts = opts or {}
+  opts.player = player
+  return Streamer(opts)
 end
 
 -- Version + engine info, for diagnostics / splash screens.
-M.VERSION = "2.0.0"
+M.VERSION = "2.1.0"
+
+-- Expose the format sniffer for tools/tests (not part of the stable API).
+-- sniff(data_or_nil, ext_or_nil) -> "sid" | "chiptune" | "midi" | nil
+M.sniff = sniff
+
 function M.info()
   return {
     version = M.VERSION,

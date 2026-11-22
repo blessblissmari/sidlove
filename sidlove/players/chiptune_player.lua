@@ -12,7 +12,8 @@ local gme_ffi = require("sidlove.ffi.gme_ffi")
 local ffi     = require("ffi")
 
 local M = {}
-M.__index = setmetatable(M, base)
+-- instance -> M's own methods, then -> base via the module metatable
+M.__index = M
 
 local function new(opts)
   opts = opts or {}
@@ -20,7 +21,7 @@ local function new(opts)
     return nil, "chiptune engine not loaded (libgme missing)"
   end
   local self = base.new(opts)
-  setmetatable(self, {__index = M})
+  setmetatable(self, M)   -- M.__index chains to base
   self.kind = "chiptune"
   self._emu = nil          -- Music_Emu* (gc-managed)
   self._track = 0
@@ -174,4 +175,4 @@ function M:dispose()
   end
 end
 
-return setmetatable(M, {__call = function(_, opts) return new(opts) end})
+return setmetatable(M, { __index = base, __call = function(_, opts) return new(opts) end })

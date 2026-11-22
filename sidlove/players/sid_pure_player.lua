@@ -27,7 +27,8 @@ local SID        = require("sidlove.sidchip")
 local base       = require("sidlove.players.base")
 
 local M = {}
-M.__index = setmetatable(M, base)
+-- instance -> M's own methods, then -> base via the module metatable
+M.__index = M
 
 -- exposed constants (mirror the native player's surface)
 M.MODEL_6581 = 0x6581
@@ -47,9 +48,9 @@ local FRAME_HZ  = { [0x00] = 50.0,    [0x01] = 60.0 }
 
 -- --- PSID header parse ----------------------------------------------------
 local function parse_psid(data, len)
-  -- data: a 0-indexed byte-accessible source. We accept either a Lua string
-  -- or a table/ffi-cdata with [i] indexing. Normalise to a string for parse.
-  if type(data) == "table" or (bit and tostring(data):find("cdata")) then
+  -- data: accept a Lua string (normal case) or any 0-indexed byte source
+  -- (ffi cdata buffer) by normalising to a string.
+  if type(data) ~= "string" then
     local t = {}
     for i = 0, len - 1 do t[i + 1] = string.char(band(data[i], 0xFF)) end
     data = table.concat(t)
@@ -128,9 +129,9 @@ function M:load_buffer_str(str, len)
   end
   if loadAddr < 0 or loadAddr > 0xFFFF then return nil, "PSID: bad load addr" end
 
-  -- build the 64K memory map and load the tune
+  -- build the 64K memory map and load the tune. Reads default to 0 via the
+  -- `or 0` in the cpu.read callback, so RAM needs no explicit zero-fill.
   local ram = {}
-  for i = 0, 0xFFFF do ram[i] = 0 end
   for i = 0, h.dataLen - 1 do
     ram[band(loadAddr + i, 0xFFFF)] = h.data:byte(dataOff + i)
   end
@@ -260,10 +261,8 @@ function M:fill_into(out_buf, n)
   for i = 1, #mono do
     local s = mono[i]
     if s > 1 then s = 1 elseif s < -1 then s = -1 end
-    local v = math.floor(s * 32767)
-    if v > 32767 then v = 32767 elseif v < -32768 then v = -32768 end
-    out_buf[idx] = v; idx = idx + 1
-    if ch == 2 then out_buf[idx] = v; idx = idx + 1 end
+    out_buf[idx] = math.floor(s * 32767); idx = idx + 1
+    if ch == 2 then out_buf[idx] = math.floor(s * 32767); idx = idx + 1 end
   end
   return #mono
 end
@@ -308,4 +307,4 @@ function M:dispose()
   self._ram, self._cpu, self._sid, self._h = nil, nil, nil, nil
 end
 
-return setmetatable(M, {__call = function(_, opts) return new(opts) end})
+return setmetatable(M, { __index = base, __call = function(_, opts) return new(opts) end })

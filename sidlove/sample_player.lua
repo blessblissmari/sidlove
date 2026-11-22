@@ -48,7 +48,8 @@ function Voice.new(bytes, opts)
   local self = setmetatable({
     data = data,
     _getbyte = getbyte,
-    len = n,
+    len = n,                    -- bytes stored
+    nsamp = (opts.bits or 8) == 4 and n * 2 or n,  -- playable SAMPLES
     rate = opts.rate or 6000,
     pos = opts.start or 0.0,
     vol = opts.vol or 1.0,
@@ -61,17 +62,20 @@ function Voice.new(bytes, opts)
 end
 
 -- Read one sample at the current fractional position; return as float -1..1.
+-- Positions count SAMPLES, not bytes: a 4-bit voice packs two samples per
+-- byte, so sample k lives in byte floor(k/2) (high nibble when k is even).
+-- The old code indexed bytes by the sample position, which both shifted the
+-- waveform and ended 4-bit voices after half their samples.
 function Voice:_sample()
   local i = math.floor(self.pos)
-  if i >= self.len then
-    if self.loop then i = i % self.len else self._done = true return 0 end
+  if i >= self.nsamp then
+    if self.loop then i = i % self.nsamp else self._done = true return 0 end
   end
-  local idx = i % self.len
   local raw
   if self.bits == 4 then
-    local byte = self._getbyte(idx)
+    local byte = self._getbyte(math.floor(i / 2))
     -- high nibble for even sample, low for odd (matches C64 $D418 players)
-    if (math.floor(self.pos) % 2) == 0 then
+    if i % 2 == 0 then
       raw = rshift(byte, 4)
     else
       raw = band(byte, 0x0f)
@@ -79,23 +83,19 @@ function Voice:_sample()
     -- 4-bit unsigned 0..15 -> signed -1..1 (center at 8)
     return ((raw - 8) / 8.0) * self.vol
   else
-    raw = self._getbyte(idx)
+    raw = self._getbyte(i)
     -- 8-bit unsigned 0..255 -> signed -1..1
     return ((raw - 128) / 128.0) * self.vol
   end
 end
 
-function Voice:tick(dt)
-  if self._done then return end
-  self.pos = self.pos + self.rate * dt
-  if not self.loop and self.pos >= self.len then
-    self._done = true
-    self.pos = self.len
-  end
-end
-
 function Voice:done() return self._done end
 function Voice:reset() self.pos = 0 self._done = false end
+
+-- NOTE: there is deliberately no Voice:tick()/Sample:tick(). mix_into is the
+-- single place that advances positions (one step per output frame, so pitch
+-- is exact). Advancing in two places made voices run at 2x speed when a
+-- caller used both - the classic double-advance bug.
 
 -- The Sample mixer -------------------------------------------------------
 
@@ -105,6 +105,7 @@ function M.new(opts)
     voices = {},
     sampleRate = opts.sampleRate or 44100,
     channels = opts.channels or 2,
+    enabled  = true,   -- the Streamer skips mixers with enabled == false
   }, M)
   return self
 end
@@ -129,18 +130,25 @@ end
 -- Mix into an interleaved int16 stereo buffer alongside whatever's there.
 -- out is int16_t[n*2] (desktop) OR a 1-indexed Lua table (web). This ADDS to
 -- the existing samples (clamped) so it layers cleanly over a SID buffer.
+-- Also advances every voice by n output frames - this is the one place
+-- positions move, so call it exactly once per buffer you render.
 function M:mix_into(out, n)
   if #self.voices == 0 then return end
   local sr = self.sampleRate
   local is_tab = not have_ffi  -- web: out is a Lua table, 1-indexed
+  local voices = self.voices
   for i = 0, n - 1 do
-    local acc = 0
-    for _, v in ipairs(self.voices) do
-      if not v:done() then acc = acc + v:_sample() end
+    -- per-voice mix with pan (the old code applied voice 1's pan to everyone)
+    local l, r = 0, 0
+    for k = 1, #voices do
+      local v = voices[k]
+      if not v._done then
+        local s = v:_sample()
+        local pan = v.pan or 0
+        l = l + s * (1.0 - math.max(0, pan)) * 0.5
+        r = r + s * (1.0 + math.min(0, pan)) * 0.5
+      end
     end
-    local pan = self.voices[1] and self.voices[1].pan or 0
-    local l = acc * (1.0 - math.max(0, pan)) * 0.5
-    local r = acc * (1.0 + math.min(0, pan)) * 0.5
     local li = math.floor(l * 32767)
     local ri = math.floor(r * 32767)
     if is_tab then
@@ -152,11 +160,14 @@ function M:mix_into(out, n)
       out[i * 2]     = math.max(-32768, math.min(32767, out[i * 2]     + li))
       out[i * 2 + 1] = math.max(-32768, math.min(32767, out[i * 2 + 1] + ri))
     end
-    for _, v in ipairs(self.voices) do
+    -- advance every voice by exactly one output frame
+    for k = 1, #voices do
+      local v = voices[k]
       v.pos = v.pos + v.rate / sr
-      if not v.loop and v.pos >= v.len then v._done = true end
+      if not v.loop and v.pos >= v.nsamp then v._done = true end
     end
   end
 end
 
-return M
+-- Constructor sugar: Sample{...} == Sample.new(...) (main.lua calls it plain).
+return setmetatable(M, { __call = function(_, ...) return M.new(...) end })

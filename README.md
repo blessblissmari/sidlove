@@ -102,16 +102,41 @@ For MIDI you must supply a SoundFont:
 local player = sidlove.load("song.mid", { soundfont = "sf/GeneralUser.sf2" })
 ```
 
-The demo `main.lua` in this folder is a full-featured example: load any
+The demo `main.lua` at the repo root is a full-featured example: load any
 tune from the command line, on-screen SID-register raster bars, voice
-muting, filter toggle, sub-song switching, a 4-bit digi drum loop, and a
-live ADSR filter sweep. Run it with:
+muting, filter toggle, sub-song switching, a 4-bit digi drum loop (press
+`D` — it is mixed over the tune by the Streamer), and a live ADSR filter
+sweep. Run it straight from a clone of this repo:
 
 ```
-love sidlove path/to/tune.sid
-love sidlove path/to/tune.mid      # set SF env var to your .sf2 path
-love sidlove path/to/tune.nsf
+love .                        # plays the bundled sidlove/assets/test.psid
+love . path/to/tune.sid
+love . path/to/tune.mid       # set SF env var to your .sf2 path
+love . path/to/tune.nsf
 ```
+
+To use the demo in your own game instead, copy `main.lua` and the
+`sidlove/` folder into your game folder.
+
+## Testing
+
+The suite runs headless — no LÖVE, no network — and must be green on both
+interpreters before a change ships:
+
+```
+bash run_tests.sh             # picks luajit or lua5.1, whichever exists
+luajit tests/run.lua          # native engines (bundled .so files load)
+lua5.1  tests/run.lua         # pure-Lua path, what love.js runs
+```
+
+It covers the bit-op shim, the 6502 core (hand-assembled program), the SID
+chip (envelope/mute/regs/waveforms), PSID parsing + rendering, format
+sniffing, the public API, and the envelope/sample/streamer modules —
+including regression tests for every bug this repo has ever had. `luajit`
+exercises the native engine, `lua5.1` the pure engine; both must pass.
+
+For a WAV-rendering smoke test of the native libraries on a new platform,
+run `luajit smoke_test.lua` (see the header of that file).
 
 ## Ship list (what native binaries to bundle)
 

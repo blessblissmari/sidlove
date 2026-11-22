@@ -17,9 +17,16 @@
 -- ADSR envelopes that map to any of those.
 
 local M = {}
-M.__index = M
-M.Envelope = Envelope   -- exported so user code can build ADSRs directly
-M.Binding   = Binding
+M.__index = M   -- instance -> M's own methods (Filter() module sugar is at the tail)
+
+-- The native-ffi handles are needed only by the preset setters. Load them
+-- safely so the pure-Lua / web build (no ffi) still constructs envelopes.
+local have_ffi = pcall(require, "ffi")
+local sid_ffi, fluid_ffi
+if have_ffi then
+  sid_ffi   = require("sidlove.ffi.sid_ffi")
+  fluid_ffi = require("sidlove.ffi.fluid_ffi")
+end
 
 -- Standard MIDI continuous controller numbers (subset).
 M.CC_MODWHEEL     = 1
@@ -86,43 +93,62 @@ function Envelope:value() return self._cur end
 function Envelope:state() return self._state end
 function Envelope:done() return self._state == "done" end
 
--- Advance by dt seconds. Updates self._cur.
+-- Advance by dt seconds. Updates self._cur. A large dt traverses as many
+-- phases as it covers (a 0.5s frame on a 0.1s attack runs the whole ADSR),
+-- so callers can never get stuck in a phase by passing big frames.
 function Envelope:tick(dt)
-  local s = self._state
-  if s == "idle" or s == "done" then self._cur = 0 return end
-  self._t = self._t + dt
-  if s == "attack" then
-    if self._t >= self.attack then
-      self._cur = self.peak
-      self._state = "decay"
-      self._t = 0
-    else
-      self._cur = self.peak * (self._t / self.attack)
-    end
-  elseif s == "decay" then
-    if self._t >= self.decay then
+  if self._state == "idle" or self._state == "done" then self._cur = 0 return end
+  local left = dt
+  while left > 0 do
+    local s = self._state
+    if s == "attack" then
+      local rem = self.attack - self._t
+      if left >= rem then
+        left = left - rem
+        self._cur = self.peak
+        self._state, self._t = "decay", 0
+      else
+        self._t = self._t + left
+        self._cur = self.peak * (self._t / self.attack)
+        left = 0
+      end
+    elseif s == "decay" then
+      local rem = self.decay - self._t
+      if left >= rem then
+        left = left - rem
+        self._cur = self.sustain_level * self.peak
+        self._state, self._t = "sustain", 0
+      else
+        self._t = self._t + left
+        local a = self._t / self.decay
+        self._cur = self.peak + (self.sustain_level * self.peak - self.peak) * a
+        left = 0
+      end
+    elseif s == "sustain" then
       self._cur = self.sustain_level * self.peak
-      self._state = "sustain"
-      self._t = 0
+      local rem = self.sustain - self._t
+      if left >= rem then
+        left = left - rem
+        self._state, self._t = "release", 0   -- auto-release when hold time ends
+        self._relstart = self._cur
+      else
+        self._t = self._t + left
+        left = 0
+      end
+    elseif s == "release" then
+      local rem = self.release - self._t
+      if left >= rem then
+        left = left - rem
+        self._cur = 0
+        self._state, self._t = "done", 0
+      else
+        self._t = self._t + left
+        local a = self._t / self.release
+        self._cur = (self._relstart or self._cur) * (1 - a)
+        left = 0
+      end
     else
-      local a = self._t / self.decay
-      self._cur = self.peak + (self.sustain_level * self.peak - self.peak) * a
-    end
-  elseif s == "sustain" then
-    self._cur = self.sustain_level * self.peak
-    if self._t >= self.sustain then
-      -- auto-release if no explicit release was called
-      self._state = "release"
-      self._relstart = self._cur
-      self._t = 0
-    end
-  elseif s == "release" then
-    if self._t >= self.release then
-      self._cur = 0
-      self._state = "done"
-    else
-      local a = self._t / self.release
-      self._cur = (self._relstart or self._cur) * (1 - a)
+      break  -- unknown state, don't spin
     end
   end
 end
@@ -141,10 +167,20 @@ function Binding:tick(dt)
   self.setter(self.env:value())
 end
 
+-- Constructor sugar so both forms work:
+--   Filter.Envelope.new{...}   Filter.Envelope{...}   (same for Binding)
+setmetatable(Envelope, { __call = function(_, opts) return Envelope.new(opts) end })
+setmetatable(Binding,  { __call = function(_, ...) return Binding.new(...)   end })
+
+-- Export now that the locals exist (doing this above the definitions would
+-- export nil).
+M.Envelope = Envelope
+M.Binding  = Binding
+
 -- The Filter holds a list of bindings; tick() advances all of them. This
 -- lets a single game frame drive many envelopes (e.g. one per MIDI voice).
 function M.new()
-  return setmetatable({bindings = {}, _idx = 0}, M)
+  return setmetatable({bindings = {}}, M)
 end
 
 function M:add(env, setter)
@@ -185,9 +221,8 @@ end
 -- value scaled into the gen's range; for cutoff we map 0..1 -> 20..20000 Hz.
 function M.setter_midi_gen(midi, chan, gen, lo, hi)
   return function(v)
-    local val = lo + (hi - lo) * v
-    if midi._synth then
-      fluid_ffi.lib.fluid_synth_set_gen(midi._synth, chan, gen, val)
+    if midi._synth and fluid_ffi and fluid_ffi.lib then
+      fluid_ffi.lib.fluid_synth_set_gen(midi._synth, chan, gen, lo + (hi - lo) * v)
     end
   end
 end
@@ -197,7 +232,9 @@ end
 -- Bind envelope 0..1 -> reSIDfp 6581 filter curve sweep (0..1).
 function M.setter_sid_filter6581(sid)
   return function(v)
-    sid_ffi.lib.sidlove_sid_set_filter(sid._h, v, 12500.0, 1)
+    if sid_ffi and sid_ffi.lib then
+      sid_ffi.lib.sidlove_sid_set_filter(sid._h, v, 12500.0, 1)
+    end
   end
 end
 
@@ -208,4 +245,5 @@ function M.setter_sid_gate(sid, sid_num, voice)
   end
 end
 
-return M
+-- Constructor sugar: Filter{...} == Filter.new(...) (main.lua calls it plain).
+return setmetatable(M, { __call = function(_, ...) return M.new(...) end })
