@@ -182,6 +182,7 @@ function M.load_buffer(data, kind, opts)
   end
   if not player then return nil, perr end
   player._kind = kind
+  player.kind = kind       -- main.lua / user code checks player.kind
   player._pure = (kind == "sid" and (opts.force_pure or not M.engines.sid)) or false
   return player, kind
 end

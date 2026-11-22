@@ -24,6 +24,7 @@
 --   Esc        quit
 
 local sidlove = require("sidlove")
+local bit = require("sidlove.bit")  -- works in vanilla Lua 5.1 / love.js too
 
 local streamer, player, raster, drum, filter, envbinding
 local kind, info_str
@@ -41,10 +42,12 @@ function love.load(args)
   for _, a in ipairs(args) do
     if not a:find("^%-") then path = a break end
   end
-  -- Default: look for sidlove/assets/sample.sid bundled with the demo.
+  -- Default: look for a bundled tune. The repo ships sidlove/assets/test.psid.
   if not path then
     local candidates = {
+      "sidlove/assets/test.psid",
       "sidlove/assets/sample.sid",
+      "assets/test.psid",
       "assets/sample.sid",
       "sample.sid",
     }
@@ -84,12 +87,17 @@ function love.load(args)
   player:setLoop(true)
   player:play()
 
-  -- Raster: snap the SID state at the play-rate for visuals.
-  raster = sidlove.Raster{
-    player = player,
-    clock = (player.info and player.info().clock_speed == 2) and "ntsc" or "pal",
-    on_tick = function(dt, frame) end,
-  }
+  -- Raster: snap the SID state at the play-rate for visuals. Desktop-only
+  -- (reads live SID regs via the native shim); nil on web / no-native builds.
+  if sidlove.Raster then
+    raster = sidlove.Raster{
+      player = player,
+      clock = (player.info and player.info().clock_speed == 2) and "ntsc" or "pal",
+      on_tick = function(dt, frame) end,
+    }
+  else
+    raster = nil
+  end
 
   -- 4-bit digi drum: a tiny loop of packed nibbles. This is what a C64
   -- digi-drum looks like in a tune - 256 samples of 4-bit data looped at
@@ -113,6 +121,7 @@ function love.load(args)
   -- Filter module: a slow ADSR that sweeps the SID 6581 filter curve (or
   -- for MIDI, the filter cutoff CC). Demonstrates live patching.
   filter = sidlove.Filter()
+end  -- closes love.load
 
 -- We export Envelope from filter.lua so the filter-sweep demo works.
 local function make_filter_envelope()
