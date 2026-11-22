@@ -12,18 +12,21 @@
 -- to come out of the SID chip itself, write the sample into the tune's
 -- data via a custom PSID - that path is in sid_player:load_buffer.)
 --
--- Voices are tiny: { data = uint8_t*, len = N, rate = Hz, pos = double,
---   vol = 0..1, loop = bool, bits = 4 or 8 }. tick(dt) advances the read
---   position; fill_into(out, n) adds the voice into the interleaved buffer.
+-- v2.0: FFI is optional. On desktop (LuaJIT) the voice data lives in a C
+-- uint8 buffer (ffi.copy, indexed directly). On love.js / web (no FFI) it
+-- lives in a Lua string and is read via string.byte. bit operations go
+-- through sidlove.bit so they work in vanilla Lua 5.1 too.
 
-local ffi = require("ffi")
+local have_ffi, ffi = pcall(require, "ffi")
+local bit = require("sidlove.bit")
+local band, rshift = bit.band, bit.rshift
 
 local M = {}
 M.__index = M
-M.Voice = Voice   -- exported so user code can build digi voices directly
 
 local Voice = {}
 Voice.__index = Voice
+M.Voice = Voice
 
 -- Create a voice from a Lua string of sample bytes. bits=4 packs two samples
 -- per byte (high nibble first, like the C64 $D418 convention); bits=8 is one
@@ -32,10 +35,19 @@ Voice.__index = Voice
 function Voice.new(bytes, opts)
   opts = opts or {}
   local n = #bytes
-  local buf = ffi.new("uint8_t[?]", n)
-  ffi.copy(buf, bytes, n)
+  local data, getbyte
+  if have_ffi then
+    local buf = ffi.new("uint8_t[?]", n)
+    ffi.copy(buf, bytes, n)
+    data = buf
+    getbyte = function(i) return buf[i] end
+  else
+    data = bytes   -- keep the Lua string
+    getbyte = function(i) return string.byte(bytes, i + 1) end
+  end
   local self = setmetatable({
-    data = buf,
+    data = data,
+    _getbyte = getbyte,
     len = n,
     rate = opts.rate or 6000,
     pos = opts.start or 0.0,
@@ -54,19 +66,20 @@ function Voice:_sample()
   if i >= self.len then
     if self.loop then i = i % self.len else self._done = true return 0 end
   end
+  local idx = i % self.len
   local raw
   if self.bits == 4 then
-    local byte = self.data[i % self.len]
+    local byte = self._getbyte(idx)
     -- high nibble for even sample, low for odd (matches C64 $D418 players)
     if (math.floor(self.pos) % 2) == 0 then
-      raw = bit.rshift(byte, 4)
+      raw = rshift(byte, 4)
     else
-      raw = bit.band(byte, 0x0f)
+      raw = band(byte, 0x0f)
     end
     -- 4-bit unsigned 0..15 -> signed -1..1 (center at 8)
     return ((raw - 8) / 8.0) * self.vol
   else
-    raw = self.data[i % self.len]
+    raw = self._getbyte(idx)
     -- 8-bit unsigned 0..255 -> signed -1..1
     return ((raw - 128) / 128.0) * self.vol
   end
@@ -114,28 +127,31 @@ function M:tick(dt)
 end
 
 -- Mix into an interleaved int16 stereo buffer alongside whatever's there.
--- out is int16_t[n*2]. This ADDS to the existing samples (clamped) so it
--- layers cleanly over a SID/chiptune buffer the streamer already filled.
+-- out is int16_t[n*2] (desktop) OR a 1-indexed Lua table (web). This ADDS to
+-- the existing samples (clamped) so it layers cleanly over a SID buffer.
 function M:mix_into(out, n)
   if #self.voices == 0 then return end
   local sr = self.sampleRate
+  local is_tab = not have_ffi  -- web: out is a Lua table, 1-indexed
   for i = 0, n - 1 do
     local acc = 0
     for _, v in ipairs(self.voices) do
       if not v:done() then acc = acc + v:_sample() end
     end
-    -- linear pan: -1 = full left, +1 = full right
     local pan = self.voices[1] and self.voices[1].pan or 0
     local l = acc * (1.0 - math.max(0, pan)) * 0.5
     local r = acc * (1.0 + math.min(0, pan)) * 0.5
-    -- clamp & add into the int16 buffer
-    local li = math.max(-32768, math.min(32767, math.floor(out[i*2]   + l * 32767)))
-    local ri = math.max(-32768, math.min(32767, math.floor(out[i*2+1] + r * 32767)))
-    out[i*2]   = li
-    out[i*2+1] = ri
-    -- advance each voice's fractional position by 1/sampleRate of a second
-    -- (we ticked once per frame already, but this is the per-sample tick
-    -- for accuracy when n > 1).
+    local li = math.floor(l * 32767)
+    local ri = math.floor(r * 32767)
+    if is_tab then
+      local ex_l = out[i * 2 + 1] or 0
+      local ex_r = out[i * 2 + 2] or 0
+      out[i * 2 + 1] = math.max(-32768, math.min(32767, ex_l + li))
+      out[i * 2 + 2] = math.max(-32768, math.min(32767, ex_r + ri))
+    else
+      out[i * 2]     = math.max(-32768, math.min(32767, out[i * 2]     + li))
+      out[i * 2 + 1] = math.max(-32768, math.min(32767, out[i * 2 + 1] + ri))
+    end
     for _, v in ipairs(self.voices) do
       v.pos = v.pos + v.rate / sr
       if not v.loop and v.pos >= v.len then v._done = true end

@@ -18,35 +18,53 @@
 -- If a library is missing the corresponding engine is simply unavailable -
 -- sidlove.load("foo.sid") returns nil + a clear error. The other engines
 -- still work. This lets a game ship just the SID engine to save space.
+--
+-- v2.0: FFI is now OPTIONAL. love.js (and any Lua 5.1 runtime without
+-- LuaJIT) has no FFI, so the native engines can't load there. In that case
+-- we set M.web=true and M.engines.pure stays true (the pure-Lua SID path
+-- needs no FFI), and sidlove routes .sid/.prg to sid_pure_player. The native
+-- path still works unchanged on desktop LuaJIT where FFI is present.
 
-local ffi = require("ffi")
-local gme_ffi   = require("sidlove.ffi.gme_ffi")
-local sid_ffi   = require("sidlove.ffi.sid_ffi")
-local fluid_ffi = require("sidlove.ffi.fluid_ffi")
+local have_ffi, ffi = pcall(require, "ffi")
+local gme_ffi, sid_ffi, fluid_ffi
+if have_ffi then
+  -- these modules themselves require("ffi"); load them only when ffi exists
+  -- so a missing ffi doesn't break the whole library on web.
+  gme_ffi   = require("sidlove.ffi.gme_ffi")
+  sid_ffi   = require("sidlove.ffi.sid_ffi")
+  fluid_ffi = require("sidlove.ffi.fluid_ffi")
+end
 
 local M = {}
 M.os = nil
 M.arch = nil
 M.dir = nil          -- the native/<tag> directory
-M.engines = { gme = false, sid = false, fluid = false }
+M.web = false        -- true when running without FFI (love.js / WASM)
+M.engines = { gme = false, sid = false, fluid = false, pure = true }
 
 -- Detect the platform. Love2D sets love._os; LuaJIT sets jit.os / jit.arch.
 -- We prefer love._os when present because it distinguishes Android from
--- generic Linux, which jit.os cannot.
+-- generic Linux, which jit.os cannot. If neither love._os nor jit is
+-- available we're in love.js / a no-FFI Lua -> "Web".
 local function detect()
   local os_name, arch
   local ok_love, love_t = pcall(require, "love")
   local love_os
   if ok_love and love_t and love_t._os then love_os = love_t._os end
-  -- love._os is one of: "windows", "linux", "osx", "android", "ios"
   if love_os == "windows" then os_name = "Windows"
   elseif love_os == "osx"   then os_name = "OSX"
   elseif love_os == "android" then os_name = "Android"
   elseif love_os == "ios" then os_name = "iOS"
-  else
+  elseif have_ffi and jit then
     os_name = jit.os    -- "Linux", "Windows", "OSX", "BSD"
+  else
+    os_name = "Web"     -- love.js / vanilla Lua 5.1 without jit
   end
-  arch = jit.arch      -- "x64", "x86", "arm64", "arm", "mips"...
+  if have_ffi and jit then
+    arch = jit.arch    -- "x64", "x86", "arm64", "arm", "mips"...
+  else
+    arch = "wasm"
+  end
   return os_name, arch
 end
 
@@ -66,19 +84,12 @@ local function tag_for(os_name, arch)
     elseif arch == "arm" then return "linux-arm"
     else return "linux-x64" end
   end
-  return nil
+  return nil  -- "Web" has no native dir
 end
 
--- Resolve a file path inside the game. In Love2D the game's files are inside
--- the .love archive by default, but native .so/.dll CANNOT live inside a
--- zipped .love (the OS loader can't read them from there). They must sit on
--- the real filesystem next to the executable. We use love.filesystem.getSaveDirectory
--- or the source directory. For a fused game this is the same as the exe dir.
+-- Resolve the native dir on the real filesystem (native .so/.dll can't live
+-- inside a zipped .love; the OS loader can't read them from there).
 local function resolve_native_dir(native_subdir)
-  -- Try, in order:
-  --  1.love.filesystem.getSourceBaseDirectory()/<game>/sidlove/native/<tag> (unfused)
-  --  2.love.filesystem.getSaveDirectory()/sidlove/native/<tag>
-  --  3. relative ./sidlove/native/<tag> (for plain `luajit main.lua` testing)
   local candidates = {}
   local ok, love = pcall(require, "love")
   if ok and love and love.filesystem then
@@ -90,12 +101,6 @@ local function resolve_native_dir(native_subdir)
   table.insert(candidates, "./sidlove/native/" .. native_subdir)
   table.insert(candidates, "./native/" .. native_subdir)
   for _, c in ipairs(candidates) do
-    local f = io.open(c .. "/.exists", "r")
-    if f then f:close() return c end
-    -- fall back: check if any .so/.dll is in there
-    f = io.open(c, "r")
-    if f then f:close() end
-    -- cheap probe: try to open the first candidate file
     for _, probe in ipairs{"libgme.so","libgme.dll","libgme.dylib","sidlove_sid.so","sidlove_sid.dll"} do
       local pf = io.open(c .. "/" .. probe, "rb")
       if pf then pf:close() return c end
@@ -104,27 +109,18 @@ local function resolve_native_dir(native_subdir)
   return candidates[1]  -- return best guess even if empty, so error msgs are useful
 end
 
--- The library file names per OS. libsidplayfp's soname matters on Linux:
--- the loader wants libsidplayfp.so.6, not libsidplayfp.so, unless the dev
--- symlink is shipped too. We try soname first, then bare name.
 local function lib_names(os_name, base)
   if os_name == "Windows" then return { base .. ".dll" } end
   if os_name == "OSX"     then return { base .. ".dylib" } end
-  -- Linux / Android: try soname then bare .so
   return { base .. ".so", base .. ".so.6", base .. ".so.3", base .. ".so.0" }
 end
 
 local function try_load_any(dir, base, os_name)
+  if not have_ffi then return nil, "no FFI (web build)" end
   local names = lib_names(os_name, base)
   local last_err
   for _, n in ipairs(names) do
     local path = dir .. "/" .. n
-    local f = io.open(path, "rb")
-    if f then f:close() end
-    -- We don't require the file to exist on disk for the FFI load attempt -
-    -- sometimes it's reachable via the system loader path. But for a bundled
-    -- game we want the file in our native dir, so the existence check keeps
-    -- error messages honest.
     local ok, lib = pcall(ffi.load, path)
     if ok then return lib end
     last_err = lib
@@ -133,17 +129,20 @@ local function try_load_any(dir, base, os_name)
 end
 
 -- Public entry point. Call once at game startup (sidlove.init() does this).
--- `native_root` is optional; if nil we auto-resolve as above.
 function M.init(native_root)
   M.os, M.arch = detect()
   local tag = tag_for(M.os, M.arch)
-  if not tag then
-    return nil, "sidlove: unsupported platform " .. tostring(M.os) .. "/" .. tostring(M.arch)
-  end
   M.tag = tag
-  M.dir = native_root and (native_root .. "/" .. tag) or resolve_native_dir(tag)
+  M.dir = tag and (native_root and (native_root .. "/" .. tag) or resolve_native_dir(tag)) or nil
 
-  -- Load each engine independently. Failure of one does not abort the others.
+  -- Web / no-FFI: skip native loading entirely. The pure-Lua SID path
+  -- (sidlove.bit + m6502 + sidchip + sid_pure_player) handles .sid/.prg with
+  -- no native libs. chiptune/midi are unavailable on web (documented).
+  if not have_ffi or M.os == "Web" then
+    M.web = true
+    return M
+  end
+
   local g = M.dir and try_load_any(M.dir, "libgme", M.os)
   if g then gme_ffi.load(""); gme_ffi.lib = g; gme_ffi.loaded = true; M.engines.gme = true end
 
@@ -153,12 +152,10 @@ function M.init(native_root)
   local f = M.dir and try_load_any(M.dir, "libfluidsynth", M.os)
   if f then fluid_ffi.load(""); fluid_ffi.lib = f; fluid_ffi.loaded = true; M.engines.fluid = true end
 
-  -- Also try system loader for libgme (commonly installed on Linux).
   if not M.engines.gme then
     local ok, lib = pcall(ffi.load, "gme")
     if ok then gme_ffi.lib = lib; gme_ffi.loaded = true; M.engines.gme = true end
   end
-  -- And system libfluidsynth.
   if not M.engines.fluid then
     local ok, lib = pcall(ffi.load, "fluidsynth")
     if ok then fluid_ffi.lib = lib; fluid_ffi.loaded = true; M.engines.fluid = true end

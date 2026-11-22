@@ -8,12 +8,13 @@
 -- means zero allocation on the hot path - the same trick Love2D games use
 -- for microphone input and procedural audio.
 --
--- The fill function calls player:fill_into(int16_buf, frames), then
--- ffi.copy's the raw int16 bytes into a SoundData's pointer (Love2D 11+
--- exposes SoundData:getPointer()). That copy is a single memcpy - much
--- faster than calling :setSample per sample.
+-- v2.0: FFI is now OPTIONAL. On desktop (LuaJIT) the fast path is used:
+-- player:fill_into(int16_buf, frames) + ffi.copy of the raw bytes into the
+-- SoundData's pointer (a single memcpy). On love.js / web (no FFI) we fall
+-- back to player:fillFloats(lua_table, frames) + SoundData:setSample() per
+-- sample. The pure-Lua sid_pure_player exposes fillFloats for exactly this.
 
-local ffi = require("ffi")
+local have_ffi, ffi = pcall(require, "ffi")
 
 local M = {}
 M.__index = M
@@ -41,13 +42,20 @@ function M.new(opts)
 
   local src = love.audio.newQueueableSource(sr, bd, ch, bc)
   src:setVolume(opts.volume or 1)
-  -- The love 11 QueueableSource API: queue(sd), getFreeBufferCount(), play().
 
-  -- Pre-allocated rotating SoundData buffers + matching int16 scratch.
+  -- Pre-allocated rotating SoundData buffers.
   local sds = {}
-  local scratch = ffi.new(string.format("int16_t[%d]", bf * ch))
   for i = 1, bc do
     table.insert(sds, love.sound.newSoundData(bf, sr, bd, ch))
+  end
+
+  -- Fast path (desktop): one int16 scratch buffer reused every frame.
+  -- Web path: a Lua table, filled by player:fillFloats.
+  local scratch, scratch_tab
+  if have_ffi then
+    scratch = ffi.new(string.format("int16_t[%d]", bf * ch))
+  else
+    scratch_tab = {}
   end
 
   local self = setmetatable({
@@ -55,8 +63,10 @@ function M.new(opts)
     source = src,
     sds = sds,
     scratch = scratch,
+    scratch_tab = scratch_tab,
     frames = bf,
     channels = ch,
+    use_ffi = have_ffi,
     _idx = 1,
     _started = false,
     _starved = 0,
@@ -69,20 +79,30 @@ end
 -- the source doesn't underrun and click.
 function M:update(dt)
   local free = self.source:getFreeBufferCount()
+  local ch = self.channels
+  local n = self.frames
   while free > 0 do
     local sd = self.sds[self._idx]
     self._idx = self._idx % #self.sds + 1
-    local got = self.player:fill_into(self.scratch, self.frames)
-    if got < self.frames then
-      -- Underrun or end of track: zero the rest so we don't play garbage.
-      ffi.fill(self.scratch + got * self.channels,
-               (self.frames - got) * self.channels * 2, 0)
-      self._starved = self._starved + 1
+    local got
+    if self.use_ffi then
+      got = self.player:fill_into(self.scratch, n)
+      if got < n then
+        ffi.fill(self.scratch + got * ch, (n - got) * ch * 2, 0)
+        self._starved = self._starved + 1
+      end
+      ffi.copy(sd:getPointer(), self.scratch, n * ch * 2)
+    else
+      -- web / pure-Lua path: fill a Lua table of interleaved int16, then
+      -- write each sample into the SoundData via setSample.
+      got = self.player:fillFloats(self.scratch_tab, n)
+      local total = n * ch
+      for i = 1, total do
+        local v = self.scratch_tab[i] or 0
+        sd:setSample(i - 1, v / 32768)
+      end
+      if got < n then self._starved = self._starved + 1 end
     end
-    -- Copy raw int16 bytes into the SoundData. SoundData:getPointer returns
-    -- a void* to its internal sample buffer; the layout for 16-bit stereo
-    -- is exactly interleaved L,R,L,R which is what every player produces.
-    ffi.copy(sd:getPointer(), self.scratch, self.frames * self.channels * 2)
     self.source:queue(sd)
     free = free - 1
   end

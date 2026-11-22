@@ -186,7 +186,9 @@ end
 function M.setter_midi_gen(midi, chan, gen, lo, hi)
   return function(v)
     local val = lo + (hi - lo) * v
-    midi._synth and fluid_ffi.lib.fluid_synth_set_gen(midi._synth, chan, gen, val)
+    if midi._synth then
+      fluid_ffi.lib.fluid_synth_set_gen(midi._synth, chan, gen, val)
+    end
   end
 end
 

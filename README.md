@@ -8,10 +8,23 @@ VGM / SPC / AY / HES / KSS** chiptunes (via libgme), and **standard MIDI files**
 ([CSDb #155560](https://csdb.dk/release/?id=155560)).
 
 It is **low-level** by design: each engine is a `Player` object with a
-`fill_into(buf, n)` method; a `Streamer` pumps it into LÖVE's
-`QueueableSource` with a ring of pre-allocated `SoundData` buffers so the hot
-path allocates nothing. Demoscene helpers (`Raster`, `Sample`, `Filter`)
-layer on top and are opt-in.
+`fill_into(buf, n)` (desktop) or `fillFloats(tab, n)` (web) method; a `Streamer`
+pumps it into LÖVE's `QueueableSource` with a ring of pre-allocated `SoundData`
+buffers so the hot path allocates nothing. Demoscene helpers (`Raster`,
+`Sample`, `Filter`) layer on top and are opt-in.
+
+### ✨ What's new in v2.0 — love.js / web support
+
+v1.0 could not run in love.js (the web build) because LuaJIT FFI does not work
+in WASM. **v2.0 fixes this.** sidlove now ships a **pure-Lua SID emulation
+path** — `bit.lua` + `m6502.lua` + `sidchip.lua` + `players/sid_pure_player.lua`
+— that runs in vanilla Lua 5.1 with no FFI, so `.sid` / `.prg` files play in
+the browser out of the box. The native reSIDfp path is kept as the
+high-quality engine on desktop; the pure-Lua path is the portable fallback and
+the automatic web default. There is also a standalone **`sidlove_web.js`** — a
+self-contained JS 6502 + SID emulator with Web Audio output — for projects that
+want SID audio to bypass love.js entirely. See
+[§ love.js / web — supported](#lovejs-web--supported).
 
 ## Architecture
 
@@ -152,11 +165,77 @@ files will fail to load with a clear error but the SID engine still works.
 LÖVE for Android loads native libs from the app's private data directory;
 see `platform.lua` for the path resolution logic.
 
-### love.js (web) — NOT supported
+### love.js / web — supported (v2.0)
 
-LuaJIT FFI does not work in love.js (no native code in WASM). For web you
-would need a pure-JS SID emulator (e.g. [jsSID](https://github.com/rgart/)) —
-out of scope for this library.
+love.js compiles LÖVE + Lua to WASM via Emscripten. LuaJIT FFI does not work
+there (no native code in WASM, and love.js runs vanilla Lua 5.1), so the
+native `sidlove_sid.so` / libgme / libfluidsynth engines cannot load. sidlove
+detects this automatically — `platform.init()` sets `platform.web = true` and
+`os = "Web"` — and routes `.sid` / `.prg` files to the **pure-Lua SID engine**
+(`sidlove.bit` + `sidlove.m6502` + `sidlove.sidchip` +
+`sidlove.players.sid_pure_player`), which has no FFI dependency and runs in
+vanilla Lua 5.1.
+
+**What works on web:** SID playback (`.sid`, `.prg`), the `Streamer` (it falls
+back to `SoundData:setSample` per sample instead of `ffi.copy`), the `Sample`
+digi mixer (voices stored as Lua strings instead of C buffers), and all the
+player controls (play/stop/seek/mute/loop).
+
+**What does NOT work on web:** chiptune (libgme) and MIDI (libfluidsynth) —
+these need native C. The `Raster` visualiser is desktop-only (it reads live
+SID registers via the native shim); on web, read `player:sid_status()` for the
+same 32-register snapshot as a Lua table and roll your own bars.
+
+**Using it:** nothing changes in your code. The same call works on desktop and
+web:
+
+```lua
+local sidlove = require("sidlove")
+sidlove.init()                                   -- auto-detects web on love.js
+local player = sidlove.load("music.sid")         -- routes to pure player on web
+local s = sidlove.Streamer{ player = player }
+function love.update(dt) s:update(dt) end
+```
+
+You can force the pure-Lua engine on desktop too (handy for testing or when
+you want a dependency-free build):
+
+```lua
+local player = sidlove.load("music.sid", { force_pure = true })
+```
+
+**Performance:** the pure-Lua engine renders faster than realtime in both
+LuaJIT (~0.01 s per 0.3 s of audio) and vanilla Lua 5.1 (~0.06 s per 0.3 s),
+measured against `assets/test.psid`. love.js runs Lua-in-WASM (~5–10× slower
+than native Lua), so at 44.1 kHz stereo you have comfortable headroom for a
+game's background music; for very busy multi-voice tunes you can drop to
+22050 Hz (`opts.sampleRate = 22050`).
+
+**Standalone JS player (alternative):** for projects that want SID audio to
+come out of a native JS emulator rather than the pure-Lua path, include
+`sidlove_web.js` from the page that hosts love.js:
+
+```html
+<script src="sidlove_web.js"></script>
+<script>
+  const sid = new SidloveWeb();
+  sid.loadUrl('music.sid').then(() => sid.play(0));
+</script>
+```
+
+It runs its own 6502 + SID core and plays through its own `AudioContext`,
+independent of love.js's audio system (the two mix at the browser level). Use
+this when you want the CPU cost off the Lua/WASM thread, or to play SID music
+on a page with no love.js at all.
+
+**Fidelity note:** the pure-Lua and JS engines share the same model — full
+legal-opcode 6502, three voices with ADSR + combined waveforms, and a linear
+state-variable filter. They are not bit-exact with the 6581's non-linear
+analog filter, and play() is called at the video frame rate (50/60 Hz) which
+is correct for VBI tunes and fine for the great majority of CIA tunes, but
+sample/digi-heavy tunes that rely on cycle-exact IRQ timing (e.g. some
+players in HVSC) are approximated. For bit-exact 6581/8580 sound, use the
+native reSIDfp engine on desktop.
 
 ## Building the SID shim
 
@@ -344,22 +423,31 @@ as an RSID-style tune). `sidlove.load("amib.prg")` works.
 
 ## Limitations
 
-- **love.js / web**: not supported (no LuaJIT FFI in WASM). Use a JS SID
-  emulator separately for the web build.
+- **love.js / web**: SID playback is supported via the pure-Lua engine (no
+  FFI). Chiptune (libgme) and MIDI (libfluidsynth) are **not** available on
+  web — they need native C. Use the standalone `sidlove_web.js` if you want a
+  JS-native SID emulator independent of love.js. See
+  [§ love.js / web — supported](#lovejs-web--supported).
+- **Pure-Lua / JS SID fidelity**: the portable engines use a linear SVF
+  filter, not the 6581's non-linear analog model, and call play() at the video
+  frame rate. VBI tunes and most CIA tunes play correctly; cycle-exact
+  sample/digi tunes are approximated. Use the native reSIDfp engine on desktop
+  for bit-exact sound.
 - **iOS**: technically works (the shim builds with `make ios-arm64`), but
   iOS app sandboxing makes loading arbitrary `.so` files from the app
   bundle require special packaging — link the engines statically instead.
 - **Streaming from inside a zipped `.love`**: native `.so`/`.dll` cannot be
   loaded from inside a zip. Ship them next to the executable (the
-  `platform.lua` resolver handles this).
+  `platform.lua` resolver handles this). The pure-Lua SID path has no such
+  constraint, which is why it's the right choice for fused love.js builds.
 - **Sample rate**: all three engines resample to whatever LÖVE's audio
   device runs at (44.1 kHz default). For lowest latency match
-  `love.audio.getSampleRate()`.
+  `love.audio.getSampleRate()`. On web, drop to 22050 if CPU is tight.
 
 ## Verification
 
 The three C harnesses in `scripts/` (`verify_sid.c`, `verify_gme.c`,
-`verify_fluid.c`) prove each engine produces real audio. They were run
+`verify_fluid.c`) prove each native engine produces real audio. They were run
 against the bundled Linux libraries and produced:
 
 | Engine | Output               | Peak amplitude |
@@ -370,6 +458,27 @@ against the bundled Linux libraries and produced:
 
 The test tunes (`assets/test.psid`, `assets/test.gbs`) are minimal
 hand-assembled 6502 / SM83 programs (28 / 32 bytes of code), public domain.
+
+### Pure-Lua SID engine (v2.0, web path)
+
+`scripts/test_pure_player.py` renders `assets/test.psid` through
+`sidlove.players.sid_pure_player` in **both** LuaJIT 2.1 (desktop) and vanilla
+Lua 5.1 (the love.js runtime, via lupa), proving the no-FFI path works and
+produces identical output across runtimes:
+
+| Runtime         | 0.3 s render time | Peak | RMS  | Result |
+|-----------------|-------------------|------|------|--------|
+| LuaJIT 2.1      | 0.01 s            | 0.50 | 0.29 | non-silent ✓ |
+| vanilla Lua 5.1 | 0.06 s            | 0.50 | 0.29 | non-silent ✓ |
+
+Both faster than realtime. The matching peak/RMS confirms `sidlove.bit`
+(arithmetic fallback) produces the same results as LuaJIT's native `bit`
+library — i.e. the web build sounds the same as desktop when both use the
+pure engine. `scripts/test_public_api.py` exercises the full
+`sidlove.init()` → `sidlove.load()` → `player:render()` path in both runtimes
+and confirms web auto-detection (`os = "Web"`, `web = true`) and `.sid` →
+pure-player routing. `sidlove_web.js` is syntax-checked and smoke-tested in
+Node (parses `test.psid`, renders non-silent audio, peak ≈ 0.50).
 
 ## License
 
